@@ -239,6 +239,9 @@ void
 Listener::shutdown() {
     if (shutdownFd.isBound()) shutdownFd.notify();
     reactor_->shutdown();
+	if ( listen_fd!=-1 )
+		close ( listen_fd );
+	listen_fd = -1;
 }
 
 Async::Promise<Listener::Load>

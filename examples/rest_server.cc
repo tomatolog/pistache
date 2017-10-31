@@ -5,171 +5,208 @@
 */
 
 #include <algorithm>
+#include <sstream>
 
 #include <pistache/http.h>
 #include <pistache/router.h>
 #include <pistache/endpoint.h>
 
+#include "rocksdb/db.h"
+#include "rocksdb_replicator/rocksdb_replicator.h"
+#include <gflags/gflags.h>
+
+DEFINE_int32(thd_count, 2, "worker count");
+DEFINE_int32(http_port, 9080, "port of HTTP REST interface");
+
+DEFINE_string(db_path, "/tmp/db/testdb", "path to Rocks DB");
+DEFINE_string(db_name, "shard1", "name of Rocks DB shard");
+DEFINE_string(replicator_role, "slave,master", "role of DB replicator");
+DEFINE_int32(replicator_self_port, 9081, "port of replicator itself");
+DEFINE_string(replicator_host, "127.0.0.1", "host of replicator interface");
+DEFINE_int32(replicator_port, 9082, "port of replicator interface");
+DECLARE_int32(rocksdb_replicator_port);
+
 using namespace std;
 using namespace Pistache;
 
-void printCookies(const Http::Request& req) {
+void printCookies(const Http::Request& req) 
+{
     auto cookies = req.cookies();
     std::cout << "Cookies: [" << std::endl;
     const std::string indent(4, ' ');
-    for (const auto& c: cookies) {
+    for (const auto& c: cookies) 
+	{
         std::cout << indent << c.name << " = " << c.value << std::endl;
     }
     std::cout << "]" << std::endl;
 }
 
-namespace Generic {
-
-void handleReady(const Rest::Request&, Http::ResponseWriter response) {
-    response.send(Http::Code::Ok, "1");
+namespace Generic 
+{
+	void handleReady(const Rest::Request&, Http::ResponseWriter response) 
+	{
+		response.send(Http::Code::Ok, "1");
+	}
 }
 
-}
-
-class StatsEndpoint {
+class StatsEndpoint
+{
 public:
     StatsEndpoint(Address addr)
         : httpEndpoint(std::make_shared<Http::Endpoint>(addr))
-    { }
+    {}
 
     void init(size_t thr = 2) {
         auto opts = Http::Endpoint::options()
             .threads(thr)
+			.flags(Tcp::Options::ReuseAddr)
             .flags(Tcp::Options::InstallSignalHandler);
         httpEndpoint->init(opts);
+		setupDB();
         setupRoutes();
     }
 
     void start() {
         httpEndpoint->setHandler(router.handler());
-        httpEndpoint->serve();
+        httpEndpoint->serveThreaded();
     }
 
     void shutdown() {
         httpEndpoint->shutdown();
     }
 
+	int stopped = 0;
+
 private:
-    void setupRoutes() {
+    void setupRoutes() 
+	{
         using namespace Rest;
 
-        Routes::Post(router, "/record/:name/:value?", Routes::bind(&StatsEndpoint::doRecordMetric, this));
-        Routes::Get(router, "/value/:name", Routes::bind(&StatsEndpoint::doGetMetric, this));
+        Routes::Post(router, "/record/:name/:value?", Routes::bind(&StatsEndpoint::doPost, this));
+        Routes::Get(router, "/value/:name", Routes::bind(&StatsEndpoint::doGet, this));
+		Routes::Get(router, "/all", Routes::bind(&StatsEndpoint::getAll, this));
+		Routes::Get(router, "/seq", Routes::bind(&StatsEndpoint::getSeq, this));
+
         Routes::Get(router, "/ready", Routes::bind(&Generic::handleReady));
         Routes::Get(router, "/auth", Routes::bind(&StatsEndpoint::doAuth, this));
 
+        Routes::Post(router, "/stop", Routes::bind(&StatsEndpoint::Exit, this));
+        Routes::Get(router, "/stop", Routes::bind(&StatsEndpoint::Exit, this));
+
     }
 
-    void doRecordMetric(const Rest::Request& request, Http::ResponseWriter response) {
+    void Exit( const Rest::Request & , Http::ResponseWriter ) 
+	{
+		stopped = 1;
+	}
+
+    void doPost(const Rest::Request& request, Http::ResponseWriter response) 
+	{
         auto name = request.param(":name").as<std::string>();
 
-        Guard guard(metricsLock);
-        auto it = std::find_if(metrics.begin(), metrics.end(), [&](const Metric& metric) {
-            return metric.name() == name;
-        });
-
-        int val = 1;
+        std::string sVal = "";
         if (request.hasParam(":value")) {
             auto value = request.param(":value");
-            val = value.as<int>();
+            sVal = value.as<std::string>();
         }
 
-        if (it == std::end(metrics)) {
-            metrics.push_back(Metric(std::move(name), val));
-            response.send(Http::Code::Created, std::to_string(val));
-        }
-        else {
-            auto &metric = *it;
-            metric.incr(val);
-            response.send(Http::Code::Ok, std::to_string(metric.value()));
-        }
+		std::string sOld;
+		db->Get(rocksdb::ReadOptions(), name, &sOld);
+		db->Put(rocksdb::WriteOptions(), name, sVal);
 
+		std::stringstream sRes;
+		sRes << name << ":" << sVal << "(" << sOld << ")" << endl;
+		response.send ( Http::Code::Ok, sRes.str() );
     }
 
-    void doGetMetric(const Rest::Request& request, Http::ResponseWriter response) {
+    void doGet(const Rest::Request& request, Http::ResponseWriter response) 
+	{
         auto name = request.param(":name").as<std::string>();
 
-        Guard guard(metricsLock);
-        auto it = std::find_if(metrics.begin(), metrics.end(), [&](const Metric& metric) {
-            return metric.name() == name;
-        });
+		std::string sOld;
+		db->Get(rocksdb::ReadOptions(), name, &sOld);
 
-        if (it == std::end(metrics)) {
-            response.send(Http::Code::Not_Found, "Metric does not exist");
-        } else {
-            const auto& metric = *it;
-            response.send(Http::Code::Ok, std::to_string(metric.value()));
-        }
-
+		std::stringstream sRes;
+		sRes << name << ":" << sOld << endl;
+		response.send ( Http::Code::Ok, sRes.str() );
     }
 
-    void doAuth(const Rest::Request& request, Http::ResponseWriter response) {
+    void getAll(const Rest::Request& request, Http::ResponseWriter response) 
+	{
+		std::stringstream sRes;
+		rocksdb::Iterator * it = db->NewIterator ( rocksdb::ReadOptions() );
+		for ( it->SeekToFirst(); it->Valid(); it->Next() )
+		{
+			sRes << it->key().ToString() << ": " << it->value().ToString() << endl;
+		}
+		delete it;
+
+		response.send(Http::Code::Ok, sRes.str() );
+    }
+
+    void getSeq(const Rest::Request& request, Http::ResponseWriter response) 
+	{
+		std::stringstream sSeq;
+		sSeq << db->GetLatestSequenceNumber() << endl;
+		response.send ( Http::Code::Ok, sSeq.str() );
+    }
+
+    void doAuth(const Rest::Request& request, Http::ResponseWriter response) 
+	{
         printCookies(request);
         response.cookies()
             .add(Http::Cookie("lang", "en-US"));
         response.send(Http::Code::Ok);
     }
 
-    class Metric {
-    public:
-        Metric(std::string name, int initialValue = 1)
-            : name_(std::move(name))
-            , value_(initialValue)
-        { }
-
-        int incr(int n = 1) {
-            int old = value_;
-            value_ += n;
-            return old;
-        }
-
-        int value() const {
-            return value_;
-        }
-
-        std::string name() const {
-            return name_;
-        }
-    private:
-        std::string name_;
-        int value_;
-    };
-
-    typedef std::mutex Lock;
-    typedef std::lock_guard<Lock> Guard;
-    Lock metricsLock;
-    std::vector<Metric> metrics;
-
     std::shared_ptr<Http::Endpoint> httpEndpoint;
     Rest::Router router;
+
+	void setupDB ()
+	{
+		rocksdb::Options options;
+		options.create_if_missing = true;
+		rocksdb::DB * dbRaw;
+		rocksdb::Status status = rocksdb::DB::Open ( options, FLAGS_db_path, &dbRaw );
+		db.reset( dbRaw );
+
+		folly::SocketAddress addr ( FLAGS_replicator_host, FLAGS_replicator_port );
+
+		replicator::DBRole role = replicator::DBRole::SLAVE;
+		if ( FLAGS_replicator_role=="master" )
+		{
+			role = replicator::DBRole::MASTER;
+			FLAGS_rocksdb_replicator_port = FLAGS_replicator_self_port;
+			addr = folly::SocketAddress();
+		}
+
+		replicator = replicator::RocksDBReplicator::instance();
+		replicator->addDB ( FLAGS_db_name, db, role, addr, &replicated_db );
+	}
+
+	std::shared_ptr<rocksdb::DB> db;
+	replicator::RocksDBReplicator * replicator;
+	replicator::RocksDBReplicator::ReplicatedDB * replicated_db;
 };
 
-int main(int argc, char *argv[]) {
-    Port port(9080);
+int main(int argc, char *argv[]) 
+{
+	gflags::ParseCommandLineFlags(&argc, &argv, true);
 
-    int thr = 2;
-
-    if (argc >= 2) {
-        port = std::stol(argv[1]);
-
-        if (argc == 3)
-            thr = std::stol(argv[2]);
-    }
+    Port port(FLAGS_http_port);
+    int thr = FLAGS_thd_count;
 
     Address addr(Ipv4::any(), port);
 
-    cout << "Cores = " << hardware_concurrency() << endl;
-    cout << "Using " << thr << " threads" << endl;
+    cout << "cores = " << hardware_concurrency() << " threads = " << thr << " port = " << port << endl;
 
     StatsEndpoint stats(addr);
 
     stats.init(thr);
     stats.start();
+
+	while ( !stats.stopped )
+		sleep(1);
 
     stats.shutdown();
 }

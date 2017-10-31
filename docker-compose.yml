@@ -1,0 +1,84 @@
+version: "2"
+
+services:
+  box1:
+    build:
+      context: .
+    image: "angxu/rocksplicator-build:latest"
+    volumes:
+      - ./replicator:/rocksplicator
+      - ../pistache:/pistache
+    tty: true
+    privileged: true
+    command: /pistache/build/examples/run_rest_server --http_port 9080 --replicator_role master --db_path /tmp/test --db_name shard1 --replicator_self_port 9090
+    ports:
+      - "9080:9080"
+    networks:
+       shard_net:
+         ipv4_address: 172.16.238.10
+
+  box2:
+    build:
+      context: .
+    image: "angxu/rocksplicator-build:latest"
+    volumes:
+      - ./replicator:/rocksplicator
+      - ../pistache:/pistache
+    tty: true
+    privileged: true
+    command: /pistache/build/examples/run_rest_server --http_port 9081 --replicator_role slave --db_path /tmp/test --db_name shard1 --replicator_self_port 9090 --replicator_host 172.16.238.10 --replicator_port 9090
+    ports:
+      - "9081:9081"
+    depends_on:
+      - "box1"
+#    links:
+#      - "box1"
+    networks:
+     - shard_net
+
+  box3:
+    build:
+      context: .
+    image: "angxu/rocksplicator-build:latest"
+    volumes:
+      - ./replicator:/rocksplicator
+      - ../pistache:/pistache
+    tty: true
+    privileged: true
+    command: /pistache/build/examples/run_rest_server --http_port 9082 --replicator_role slave --db_path /tmp/test --db_name shard1 --replicator_self_port 9090 --replicator_host 172.16.238.10 --replicator_port 9090
+    ports:
+      - "9082:9082"
+    depends_on:
+      - "box1"
+#    links:
+#      - "box1"
+    networks:
+     - shard_net
+
+  box4:
+    build:
+      context: .
+    image: "angxu/rocksplicator-build:latest"
+    volumes:
+      - ./replicator:/rocksplicator
+      - ../pistache:/pistache
+    tty: true
+    privileged: true
+    command: /pistache/build/examples/run_rest_server --http_port 9083 --replicator_role slave --db_path /tmp/test --db_name shard1 --replicator_self_port 9090 --replicator_host 172.16.238.10 --replicator_port 9090
+    ports:
+      - "9083:9083"
+    depends_on:
+      - "box1"
+#    links:
+#      - "box1"
+    networks:
+     - shard_net
+
+networks:
+  shard_net:
+    driver: bridge 
+    ipam:
+      driver: default
+      config:
+      - subnet: 172.16.238.0/24
+        gateway: 172.16.238.1

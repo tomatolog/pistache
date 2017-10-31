@@ -1,0 +1,3 @@
+[submodule "replicator"]
+	path = replicator
+	url = https://github.com/pinterest/rocksplicator.git
